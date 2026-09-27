@@ -1,7 +1,9 @@
+import os
 import sys
 import logging
 
 def _add_file_handler(logger: logging.Logger, log_file_path: str) -> None:
+    os.makedirs(os.path.dirname(log_file_path), exist_ok=True)
     formatter = logging.Formatter(
         "%(asctime)s | %(levelname)-8s | %(filename)-20.20s | %(message)s"
     )
@@ -19,13 +21,15 @@ def _add_console_handler(logger: logging.Logger) -> None:
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
 
-def get_logger(name: str = "PairCheck", log_filename: str = "PairCheck.log") -> logging.Logger:
+def get_logger(name: str = "PairCheck", log_filename: str = "PairCheck.log", console: bool = True, file: bool = True) -> logging.Logger:
     logger = logging.getLogger(name)
     logger.propagate = False
     logger.setLevel(logging.DEBUG)
 
-    _add_console_handler(logger)
-    _add_file_handler(logger, f"logs/{log_filename}")
+    if console:
+        _add_console_handler(logger)
+    if file:
+        _add_file_handler(logger, f"logs/{log_filename}")
 
     return logger
 
