@@ -1,5 +1,4 @@
 import json
-import math
 import torch
 import random
 import logging
@@ -20,8 +19,7 @@ from torchmetrics.classification import (
 
 from paircheck.utils.logger import get_logger
 from paircheck.models.clip_encoder import get_clip_model
-from paircheck.utils.train import rotating_batch_sampler
-from paircheck.data.image_text_dataset import ImageTextDataset
+from paircheck.data.loading import BalancedBatchSampler, ImageTextDataset
 from paircheck.models.paircheck_head import PaircheckHead, PaircheckHeadConfig
 
 
@@ -42,15 +40,24 @@ def _split_pos_neg_samples(data_path: str | Path) -> tuple[list[dict], list[dict
     return pos_list, neg_list
 
 
-def _embed_batch(batch: list[dict], clip_model: torch.nn.Module, preprocess, tokenizer, device: str):
-    images = torch.stack([preprocess(Image.open(item["image_path"])) for item in batch]).to(device)
-    captions = tokenizer([item["caption"] for item in batch]).to(device)
+def _get_training_loader(data_path: str | Path, preprocessor, batch_size: int = 256) -> DataLoader:
+    pos, neg = _split_pos_neg_samples(data_path)
 
-    with torch.no_grad():
-        img_emb = clip_model.encode_image(images, normalize=True)
-        text_emb = clip_model.encode_text(captions, normalize=True)
+    # The positive before negative samples must not be shuffled to ensure
+    # that the BalancedBatchSampler can correctly sample from both lists. 
+    dataset = pos + neg
+    pos_indices = list(range(len(pos)))
+    neg_indices = list(range(len(pos), len(pos) + len(neg)))
 
-    return img_emb, text_emb
+    image_paths = [item["image_path"] for item in dataset]
+    captions = [item["caption"] for item in dataset]
+    labels = [item["label"] for item in dataset]
+
+    return DataLoader(
+        ImageTextDataset(image_paths, captions, labels, preprocessor),
+        batch_sampler=BalancedBatchSampler(pos_indices, neg_indices, batch_size),
+        num_workers=4,
+    )
 
 
 def _get_validation_loader(data_path: str | Path, preprocessor, batch_size: int = 256) -> DataLoader:
@@ -84,7 +91,6 @@ def _print_experiment_metrics(epoch: int, metrics: dict, LOGGER: logging.Logger,
     LOGGER.info(f"=== {type} Metrics for Epoch {epoch} ===")
     for k, metric in metrics.items():
         LOGGER.info(f"    {k}: {metric.item() if isinstance(metric, torch.Tensor) else metric}")
-    LOGGER.info("\n")
 
 
 def _calculate_metrics(scores: list | torch.Tensor, y_labels: list | torch.Tensor, auroc: BinaryAUROC, average_precision: BinaryAveragePrecision) -> dict:
@@ -142,27 +148,23 @@ def main(args: argparse.Namespace):
     EXPERIMENT_ID = args.clip_model_name + "_" + datetime.now().strftime('%Y%m%d_%H%M%S')
     LOGGER = get_logger(__name__, f"coco_dataset_train_{EXPERIMENT_ID}.log")
 
-    pos_list, neg_list = _split_pos_neg_samples(args.train_set_path)
-    N = len(pos_list) + len(neg_list)
-    total_batches = math.ceil(N / args.batch_size)
-
-    # Batch size for balanced mini-batches
-    pos_batch_size = args.batch_size // 2
-    neg_batch_size = args.batch_size - pos_batch_size
-
+    # CLIP models
     clip_model, preprocess_train, preprocess_val = get_clip_model(args.clip_model_name, device=args.device, freeze=True)
     tokenizer = open_clip.get_tokenizer(args.clip_model_name)
-    loss_fn = BCEWithLogitsLoss()
 
     # Classification head
     model_config = PaircheckHeadConfig()
     head = PaircheckHead(model_config).to(args.device)
+    loss_fn = BCEWithLogitsLoss()
 
     optimizer = torch.optim.AdamW(head.parameters(), lr=args.learning_rate)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2)
 
+    # Data loading
+    train_loader = _get_training_loader(args.train_set_path, preprocess_train, args.batch_size)
     val_loader = _get_validation_loader(args.val_set_path, preprocess_val, args.batch_size)
 
+    # Training trackers
     best_val_ap = float("-inf")
     history = {"train_loss": [], "val_loss": [], "val_ap": [], "val_auroc": [], "lr": []}
 
@@ -173,20 +175,19 @@ def main(args: argparse.Namespace):
         epoch_history = {"train_loss": [], "val_loss": [], "val_scores": [], "val_labels": []}
         auroc = BinaryAUROC().to(args.device)
         average_precision = BinaryAveragePrecision().to(args.device)
-        pos_sampler = rotating_batch_sampler(pos_list, pos_batch_size)
-        neg_sampler = rotating_batch_sampler(neg_list, neg_batch_size)
 
         # Switch to training mode for the classification head
         head.train()
-        for batch_idx in tqdm(range(1, total_batches+1), desc="Batches", position=1, leave=False):
-            batch = next(pos_sampler) + next(neg_sampler)
-            random.shuffle(batch)
-            img_emb, txt_emb = _embed_batch(batch, clip_model, preprocess_train, tokenizer, args.device)
-            y_labels = torch.tensor([float(item["label"]) for item in batch]).to(args.device)
+        for batch in tqdm(train_loader, desc="Batches", position=1, leave=False):
+            images = batch["image"].to(args.device)
+            captions = tokenizer(batch["caption"]).to(args.device)
+            y_labels = batch["label"].to(args.device)
+            img_emb = clip_model.encode_image(images, normalize=True).to(args.device)
+            txt_emb = clip_model.encode_text(captions, normalize=True).to(args.device)
 
             inputs = _enhance_features(img_emb, txt_emb, dim=1)
             logits = head(inputs)
-            loss = loss_fn(logits, y_labels)
+            loss = loss_fn(logits, y_labels.to(logits.dtype))
             loss.backward()
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
@@ -234,6 +235,8 @@ def main(args: argparse.Namespace):
                 metadata=save_metadata,
                 checkpoint_path=f"{model_checkpoint_path}/best_head.pt",
             )
+        # Update the scheduler for possible learning rate adjustments
+        scheduler.step(val_metric["average_precision_score"])
         _save_model_checkpoint(
             model=head,
             model_config=model_config,
@@ -243,9 +246,6 @@ def main(args: argparse.Namespace):
         )
         _plot_loss_curve(history, f"{model_checkpoint_path}/loss_curve.png")
         Path(f"{model_checkpoint_path}/training_history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
-
-        # Update the scheduler for possible learning rate adjustments
-        scheduler.step(val_metric["average_precision_score"])
 
         LOGGER.info(f"Epoch {epoch} completed. Best validation AP: {best_val_ap:.4f}\n")
 
