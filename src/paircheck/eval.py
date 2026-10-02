@@ -121,7 +121,7 @@ def evaluate(args):
     device = args.device
     sugarcrepe_data = sugarcrepe_loader()
 
-    clip_model, preprocess = get_clip_model(args.model_name, device)
+    clip_model, _, preprocess = get_clip_model(args.model_name, device, freeze=True)
     tokenizer = open_clip.get_tokenizer(args.model_name)
 
     all_scores = {"scores": [], "labels": []}

@@ -3,3 +3,4 @@ torch
 torchvision
 torchmetrics
 open_clip_torch
+matplotlib
